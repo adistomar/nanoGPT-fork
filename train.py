@@ -29,18 +29,21 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
+import re
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
-eval_interval = 2000
+eval_interval = 1000
 log_interval = 1
+save_interval = 1000
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
+wandb_log = True # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
@@ -101,6 +104,16 @@ else:
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
+out_dir = f"{out_dir}/{wandb_run_name}"
+if os.path.exists(out_dir) and len(os.listdir(out_dir)) > 0:
+    files = os.listdir(out_dir)
+    files = [f for f in files if f.endswith('.pt')]
+    if files:
+        init_from = "resume"
+else:
+    if master_process:
+        os.makedirs(out_dir, exist_ok=True)
+
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
 torch.manual_seed(1337 + seed_offset)
@@ -132,6 +145,7 @@ def get_batch(split):
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
+total_tokens = 0
 best_val_loss = 1e9
 
 # attempt to derive vocab_size from the dataset
@@ -157,8 +171,26 @@ if init_from == 'scratch':
     model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
+
+    def get_latest_ckpt(directory):
+        max_token_count = -1
+        ckpt_file = None
+        pattern = re.compile(r'.*?(\d+(\.\d+)?)B_ckpt\.pt$')
+
+        for filename in os.listdir(directory):
+            match = pattern.search(filename)
+            if match:
+                token_count = int(float(match.group(1)))
+                if token_count > max_token_count:
+                    max_token_count = token_count
+                    ckpt_file = filename
+
+        return ckpt_file 
+
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+    ckpt_file = get_latest_ckpt(out_dir)
+    ckpt_path = os.path.join(out_dir, ckpt_file)
+    print(f"Using checkpoint: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
@@ -176,8 +208,10 @@ elif init_from == 'resume':
         if k.startswith(unwanted_prefix):
             state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
     model.load_state_dict(state_dict)
+    state_dict = None
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
+    total_tokens = checkpoint['total_tokens']
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -254,6 +288,11 @@ raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 while True:
 
+    curr_mem = torch.cuda.memory_allocated() / 2e30
+    peak_mem = torch.cuda.max_memory_allocated() / 2e30
+
+    total_tokens += tokens_per_iter
+
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
@@ -265,27 +304,33 @@ while True:
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
+                "tokens": total_tokens,
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
+                "peak_memory": peak_mem,
+                "state_memory": curr_mem,
             })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
+        if losses['val'] < best_val_loss:
             best_val_loss = losses['val']
-            if iter_num > 0:
-                checkpoint = {
-                    'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'model_args': model_args,
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
     if iter_num == 0 and eval_only:
         break
+
+    if iter_num % save_interval == 0 and iter_num > 0 and master_process:
+        checkpoint = {
+            'model': raw_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'model_args': model_args,
+            'iter_num': iter_num,
+            'best_val_loss': best_val_loss,
+            'config': config,
+            'total_tokens': total_tokens
+        }
+        token_count = int(total_tokens // 1e9)
+        print(f"saving checkpoint to {out_dir}")
+        torch.save(checkpoint, os.path.join(out_dir, f'{wandb_run_name}_{token_count}B_ckpt.pt'))
 
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
@@ -325,11 +370,33 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        if wandb_log:
+            wandb.log({
+                "tokens": total_tokens,
+                "iter": iter_num,
+                "train/loss": lossf,
+                "lr": lr,
+                "mfu": running_mfu*100, # convert to percentage
+                "peak_memory": peak_mem,
+                "state_memory": curr_mem,
+            })
     iter_num += 1
     local_iter_num += 1
 
     # termination conditions
     if iter_num > max_iters:
+        checkpoint = {
+            'model': raw_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'model_args': model_args,
+            'iter_num': iter_num,
+            'best_val_loss': best_val_loss,
+            'config': config,
+            'total_tokens': total_tokens
+        }
+        token_count = int(total_tokens // 1e9)
+        print(f"saving final checkpoint to {out_dir}")
+        torch.save(checkpoint, os.path.join(out_dir, f"{out_dir}", f'final_{wandb_run_name}_{token_count}B_ckpt.pt'))
         break
 
 if ddp:
